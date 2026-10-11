@@ -48,8 +48,15 @@ UART_HandleTypeDef huart2;
 uint16_t dutyCycle = 10U;
 uint16_t dutyMin = 10U;
 uint16_t dutyMax = 90U;
+static uint32_t fixedPulse = 0U;
 static uint8_t rampIncreasing = 1U;
+static uint8_t rampMode = 0U;
 static uint32_t lastDutyUpdateMs = 0U;
+static volatile uint8_t buttonEdgePending = 0U;
+static GPIO_PinState buttonStableState = GPIO_PIN_SET;
+static GPIO_PinState buttonCandidateState = GPIO_PIN_SET;
+static uint8_t buttonCandidateActive = 0U;
+static uint32_t buttonCandidateSinceMs = 0U;
 
 /* USER CODE END PV */
 
@@ -59,11 +66,66 @@ static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
+static void Button_Process(uint32_t now);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void Button_Process(uint32_t now)
+{
+  GPIO_PinState pinState = HAL_GPIO_ReadPin(BotonAzul_GPIO_Port, BotonAzul_Pin);
+
+  if (buttonEdgePending != 0U)
+  {
+    buttonEdgePending = 0U;
+    buttonCandidateState = pinState;
+    buttonCandidateSinceMs = now;
+    buttonCandidateActive = 1U;
+  }
+
+  if (buttonCandidateActive != 0U)
+  {
+    if (pinState != buttonCandidateState)
+    {
+      buttonCandidateState = pinState;
+      buttonCandidateSinceMs = now;
+    }
+    else if ((uint32_t)(now - buttonCandidateSinceMs) >= 30U)
+    {
+      buttonCandidateActive = 0U;
+      if (buttonCandidateState != buttonStableState)
+      {
+        buttonStableState = buttonCandidateState;
+        if (buttonStableState == GPIO_PIN_RESET)
+        {
+          if (rampMode == 0U)
+          {
+            rampMode = 1U;
+            dutyCycle = dutyMin;
+            rampIncreasing = 1U;
+            __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2,
+                                  ((htim2.Init.Period + 1U) * dutyCycle) / 100U);
+          }
+          else
+          {
+            rampMode = 0U;
+            __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, fixedPulse);
+          }
+          lastDutyUpdateMs = now;
+        }
+      }
+    }
+  }
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == BotonAzul_Pin)
+  {
+    buttonEdgePending = 1U;
+  }
+}
 
 /* USER CODE END 0 */
 
@@ -100,8 +162,9 @@ int main(void)
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2,
-                        ((htim2.Init.Period + 1U) * dutyCycle) / 100U);
+  buttonStableState = HAL_GPIO_ReadPin(BotonAzul_GPIO_Port, BotonAzul_Pin);
+  buttonCandidateState = buttonStableState;
+  fixedPulse = __HAL_TIM_GET_COMPARE(&htim2, TIM_CHANNEL_2);
   lastDutyUpdateMs = HAL_GetTick();
   if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2) != HAL_OK)
   {
@@ -115,8 +178,10 @@ int main(void)
   while (1)
   {
     uint32_t now = HAL_GetTick();
+    Button_Process(now);
 
-    while ((uint32_t)(now - lastDutyUpdateMs) >= 20U)
+    while ((rampMode != 0U) &&
+           ((uint32_t)(now - lastDutyUpdateMs) >= 20U))
     {
       lastDutyUpdateMs += 20U;
 
@@ -306,9 +371,11 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin : BotonAzul_Pin */
   GPIO_InitStruct.Pin = BotonAzul_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(BotonAzul_GPIO_Port, &GPIO_InitStruct);
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 2, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
   /*Configure GPIO pin : LED_Pin */
   GPIO_InitStruct.Pin = LED_Pin;
