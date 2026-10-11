@@ -55,6 +55,7 @@ static uint8_t rampMode = 0U;
 static uint8_t paused = 0U;
 static volatile uint32_t appTickMs = 0U;
 static uint32_t lastDutyUpdateMs = 0U;
+static uint32_t lastAutoLedToggleMs = 0U;
 static uint32_t lastPauseLedToggleMs = 0U;
 static volatile uint8_t buttonEdgePending = 0U;
 static GPIO_PinState buttonStableState = GPIO_PIN_SET;
@@ -131,10 +132,13 @@ static void Button_HandleShortPress(uint32_t now)
     rampMode = 1U;
     dutyCycle = dutyMin;
     rampIncreasing = 1U;
+    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+    lastAutoLedToggleMs = now;
   }
   else
   {
     rampMode = 0U;
+    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
   }
 
   lastDutyUpdateMs = now;
@@ -150,10 +154,12 @@ static void Button_HandleLongPress(uint32_t now)
   if (paused != 0U)
   {
     lastPauseLedToggleMs = now;
+    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
   }
   else
   {
-    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+    lastAutoLedToggleMs = now;
   }
 
   PWM_ApplyCurrentMode();
@@ -212,6 +218,12 @@ static void Button_Process(uint32_t now)
       ((uint32_t)(now - lastPauseLedToggleMs) >= 125U))
   {
     lastPauseLedToggleMs = now;
+    HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+  }
+  else if ((paused == 0U) && (rampMode != 0U) &&
+           ((uint32_t)(now - lastAutoLedToggleMs) >= 500U))
+  {
+    lastAutoLedToggleMs = now;
     HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
   }
 }
@@ -276,6 +288,7 @@ int main(void)
   }
   fixedPulse = __HAL_TIM_GET_COMPARE(&htim2, TIM_CHANNEL_2);
   lastDutyUpdateMs = appTickMs;
+  HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
   if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
@@ -412,7 +425,7 @@ static void MX_TIM2_Init(void)
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 900;
+  sConfigOC.Pulse = 250;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
