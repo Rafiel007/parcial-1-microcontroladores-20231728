@@ -41,6 +41,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim6;
 
 UART_HandleTypeDef huart2;
 
@@ -51,12 +52,19 @@ uint16_t dutyMax = 90U;
 static uint32_t fixedPulse = 0U;
 static uint8_t rampIncreasing = 1U;
 static uint8_t rampMode = 0U;
+static uint8_t paused = 0U;
+static volatile uint32_t appTickMs = 0U;
 static uint32_t lastDutyUpdateMs = 0U;
+static uint32_t lastPauseLedToggleMs = 0U;
 static volatile uint8_t buttonEdgePending = 0U;
 static GPIO_PinState buttonStableState = GPIO_PIN_SET;
 static GPIO_PinState buttonCandidateState = GPIO_PIN_SET;
 static uint8_t buttonCandidateActive = 0U;
 static uint32_t buttonCandidateSinceMs = 0U;
+static uint32_t buttonPressStartMs = 0U;
+static uint8_t buttonLongPressHandled = 0U;
+static uint32_t acceptedShortPresses = 0U;
+static uint32_t acceptedLongPresses = 0U;
 
 /* USER CODE END PV */
 
@@ -65,20 +73,98 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_TIM6_Init(void);
 /* USER CODE BEGIN PFP */
 static void Button_Process(uint32_t now);
+static uint8_t Button_TakeEdgePending(void);
+static uint32_t PWM_DutyToPulse(uint16_t dutyPercent);
+static void PWM_ApplyCurrentMode(void);
+static void Button_HandleShortPress(uint32_t now);
+static void Button_HandleLongPress(uint32_t now);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static uint32_t PWM_DutyToPulse(uint16_t dutyPercent)
+{
+  return ((htim2.Init.Period + 1U) * dutyPercent) / 100U;
+}
+
+static uint8_t Button_TakeEdgePending(void)
+{
+  uint32_t interruptMask = __get_PRIMASK();
+  __disable_irq();
+  uint8_t edgePending = buttonEdgePending;
+  buttonEdgePending = 0U;
+  __set_PRIMASK(interruptMask);
+  return edgePending;
+}
+
+static void PWM_ApplyCurrentMode(void)
+{
+  if (paused != 0U)
+  {
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0U);
+  }
+  else if (rampMode != 0U)
+  {
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2,
+                          PWM_DutyToPulse(dutyCycle));
+  }
+  else
+  {
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, fixedPulse);
+  }
+}
+
+static void Button_HandleShortPress(uint32_t now)
+{
+  if (paused != 0U)
+  {
+    return;
+  }
+
+  acceptedShortPresses++;
+  if (rampMode == 0U)
+  {
+    rampMode = 1U;
+    dutyCycle = dutyMin;
+    rampIncreasing = 1U;
+  }
+  else
+  {
+    rampMode = 0U;
+  }
+
+  lastDutyUpdateMs = now;
+  PWM_ApplyCurrentMode();
+}
+
+static void Button_HandleLongPress(uint32_t now)
+{
+  acceptedLongPresses++;
+  paused = (paused == 0U) ? 1U : 0U;
+  lastDutyUpdateMs = now;
+
+  if (paused != 0U)
+  {
+    lastPauseLedToggleMs = now;
+  }
+  else
+  {
+    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+  }
+
+  PWM_ApplyCurrentMode();
+}
+
 static void Button_Process(uint32_t now)
 {
   GPIO_PinState pinState = HAL_GPIO_ReadPin(BotonAzul_GPIO_Port, BotonAzul_Pin);
 
-  if (buttonEdgePending != 0U)
+  if (Button_TakeEdgePending() != 0U)
   {
-    buttonEdgePending = 0U;
     buttonCandidateState = pinState;
     buttonCandidateSinceMs = now;
     buttonCandidateActive = 1U;
@@ -99,23 +185,34 @@ static void Button_Process(uint32_t now)
         buttonStableState = buttonCandidateState;
         if (buttonStableState == GPIO_PIN_RESET)
         {
-          if (rampMode == 0U)
+          buttonPressStartMs = now;
+          buttonLongPressHandled = 0U;
+        }
+        else if (buttonLongPressHandled == 0U)
+        {
+          uint32_t pressDuration = (uint32_t)(now - buttonPressStartMs);
+          if ((pressDuration >= 30U) && (pressDuration < 1500U))
           {
-            rampMode = 1U;
-            dutyCycle = dutyMin;
-            rampIncreasing = 1U;
-            __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2,
-                                  ((htim2.Init.Period + 1U) * dutyCycle) / 100U);
+            Button_HandleShortPress(now);
           }
-          else
-          {
-            rampMode = 0U;
-            __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, fixedPulse);
-          }
-          lastDutyUpdateMs = now;
         }
       }
     }
+  }
+
+  if ((buttonStableState == GPIO_PIN_RESET) &&
+      (buttonLongPressHandled == 0U) &&
+      ((uint32_t)(now - buttonPressStartMs) >= 1500U))
+  {
+    buttonLongPressHandled = 1U;
+    Button_HandleLongPress(now);
+  }
+
+  if ((paused != 0U) &&
+      ((uint32_t)(now - lastPauseLedToggleMs) >= 125U))
+  {
+    lastPauseLedToggleMs = now;
+    HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
   }
 }
 
@@ -124,6 +221,14 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   if (GPIO_Pin == BotonAzul_Pin)
   {
     buttonEdgePending = 1U;
+  }
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM6)
+  {
+    appTickMs++;
   }
 }
 
@@ -160,13 +265,22 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_TIM2_Init();
+  MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
 
   buttonStableState = HAL_GPIO_ReadPin(BotonAzul_GPIO_Port, BotonAzul_Pin);
   buttonCandidateState = buttonStableState;
+  if (buttonStableState == GPIO_PIN_RESET)
+  {
+    buttonPressStartMs = appTickMs;
+  }
   fixedPulse = __HAL_TIM_GET_COMPARE(&htim2, TIM_CHANNEL_2);
-  lastDutyUpdateMs = HAL_GetTick();
+  lastDutyUpdateMs = appTickMs;
   if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_Base_Start_IT(&htim6) != HAL_OK)
   {
     Error_Handler();
   }
@@ -177,10 +291,10 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    uint32_t now = HAL_GetTick();
+    uint32_t now = appTickMs;
     Button_Process(now);
 
-    while ((rampMode != 0U) &&
+    while ((rampMode != 0U) && (paused == 0U) &&
            ((uint32_t)(now - lastDutyUpdateMs) >= 20U))
     {
       lastDutyUpdateMs += 20U;
@@ -207,9 +321,8 @@ int main(void)
         dutyCycle++;
       }
 
-      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2,
-                            ((htim2.Init.Period + 1U) * dutyCycle) / 100U);
-      now = HAL_GetTick();
+      PWM_ApplyCurrentMode();
+      now = appTickMs;
     }
     /* USER CODE END WHILE */
 
@@ -299,7 +412,7 @@ static void MX_TIM2_Init(void)
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 100;
+  sConfigOC.Pulse = 900;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
@@ -310,6 +423,44 @@ static void MX_TIM2_Init(void)
 
   /* USER CODE END TIM2_Init 2 */
   HAL_TIM_MspPostInit(&htim2);
+
+}
+
+/**
+  * @brief TIM6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+
+  /* USER CODE BEGIN TIM6_Init 0 */
+
+  /* USER CODE END TIM6_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM6_Init 1 */
+
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 79;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 99;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM6_Init 2 */
+
+  /* USER CODE END TIM6_Init 2 */
 
 }
 
@@ -374,7 +525,7 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(BotonAzul_GPIO_Port, &GPIO_InitStruct);
-  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 2, 0);
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
   /*Configure GPIO pin : LED_Pin */
