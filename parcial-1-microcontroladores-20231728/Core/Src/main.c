@@ -45,6 +45,11 @@ TIM_HandleTypeDef htim2;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+uint16_t dutyCycle = 10U;
+uint16_t dutyMin = 10U;
+uint16_t dutyMax = 90U;
+static uint8_t rampIncreasing = 1U;
+static uint32_t lastDutyUpdateMs = 0U;
 
 /* USER CODE END PV */
 
@@ -95,6 +100,9 @@ int main(void)
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2,
+                        ((htim2.Init.Period + 1U) * dutyCycle) / 100U);
+  lastDutyUpdateMs = HAL_GetTick();
   if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
@@ -106,12 +114,38 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-   
-  HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, 1);
-    HAL_Delay (1000);
+    uint32_t now = HAL_GetTick();
 
-    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, 0);
-    HAL_Delay(1000);
+    while ((uint32_t)(now - lastDutyUpdateMs) >= 20U)
+    {
+      lastDutyUpdateMs += 20U;
+
+      if (rampIncreasing != 0U)
+      {
+        if (dutyCycle < dutyMax)
+        {
+          dutyCycle++;
+        }
+        else
+        {
+          rampIncreasing = 0U;
+          dutyCycle--;
+        }
+      }
+      else if (dutyCycle > dutyMin)
+      {
+        dutyCycle--;
+      }
+      else
+      {
+        rampIncreasing = 1U;
+        dutyCycle++;
+      }
+
+      __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2,
+                            ((htim2.Init.Period + 1U) * dutyCycle) / 100U);
+      now = HAL_GetTick();
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
