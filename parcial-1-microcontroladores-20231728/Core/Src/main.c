@@ -54,6 +54,7 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 
+/* Estado del PWM y duty manual. */
 uint16_t dutyCycle = 10U;
 uint16_t dutyMin = 10U;
 uint16_t dutyMax = 90U;
@@ -62,10 +63,14 @@ static uint16_t manualDutyPercent = 0U;
 static uint8_t rampIncreasing = 1U;
 static uint8_t rampMode = 0U;
 static uint8_t paused = 0U;
+
+/* Reloj de aplicación y plazos de rampa/LED. */
 static volatile uint32_t appTickMs = 0U;
 static uint32_t lastDutyUpdateMs = 0U;
 static uint32_t lastAutoLedToggleMs = 0U;
 static uint32_t lastPauseLedToggleMs = 0U;
+
+/* Antirrebote, duración y estadísticas del pulsador. */
 static volatile uint8_t buttonEdgePending = 0U;
 static GPIO_PinState buttonStableState = GPIO_PIN_SET;
 static GPIO_PinState buttonCandidateState = GPIO_PIN_SET;
@@ -75,6 +80,8 @@ static uint32_t buttonPressStartMs = 0U;
 static uint8_t buttonLongPressHandled = 0U;
 static uint32_t acceptedShortPresses = 0U;
 static uint32_t acceptedLongPresses = 0U;
+
+/* Recepción UART, búfer circular y armado de líneas. */
 static uint8_t uartRxByte = 0U;
 static uint8_t uartRxBuffer[UART_RX_BUFFER_SIZE];
 static volatile uint16_t uartRxHead = 0U;
@@ -89,7 +96,13 @@ static uint8_t uartLineDiscarding = 0U;
 static uint8_t uartSkipLfAfterCr = 0U;
 static uint32_t uartCompletedLineCount = 0U;
 static uint32_t uartLineOverflowCount = 0U;
+
+/* Frecuencia actual y control de telemetría. */
 static uint16_t pwmFrequencyHz = 1000U;
+static uint8_t telemetryEnabled = 0U;
+static uint32_t lastTelemetryMs = 0U;
+
+/* Cola UART de transmisión no bloqueante y errores TX. */
 static char uartTxBuffer[UART_TX_BUFFER_SIZE];
 static volatile uint16_t uartTxHead = 0U;
 static volatile uint16_t uartTxTail = 0U;
@@ -122,16 +135,20 @@ static void UART_ProcessRx(void);
 static uint8_t UART_QueueText(const char *text);
 static void UART_TxStartNext(void);
 static void UART_ProcessCommand(char *line);
+static void UART_QueueStatus(const char *prefix);
+static void UART_ProcessTelemetry(uint32_t now);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* Convierte un duty porcentual al valor de comparación de TIM2. */
 static uint32_t PWM_DutyToPulse(uint16_t dutyPercent)
 {
   return ((htim2.Init.Period + 1U) * dutyPercent) / 100U;
 }
 
+/* Calcula el reloj del contador de TIM2 desde PCLK1 y el prescaler real. */
 static uint32_t PWM_GetCounterClockHz(void)
 {
   RCC_ClkInitTypeDef clockConfig = {0};
@@ -147,6 +164,7 @@ static uint32_t PWM_GetCounterClockHz(void)
   return timerClockHz / (htim2.Init.Prescaler + 1U);
 }
 
+/* Cambia la frecuencia PWM sin modificar la base de tiempo de TIM6. */
 static uint8_t PWM_SetFrequency(uint16_t frequencyHz)
 {
   uint32_t counterClockHz = PWM_GetCounterClockHz();
@@ -171,6 +189,7 @@ static uint8_t PWM_SetFrequency(uint16_t frequencyHz)
   return 1U;
 }
 
+/* Extrae un byte pendiente del búfer circular UART en contexto de main. */
 static uint8_t UART_TakeRxByte(uint8_t *byte)
 {
   uint16_t tail = uartRxTail;
@@ -184,6 +203,7 @@ static uint8_t UART_TakeRxByte(uint8_t *byte)
   return 1U;
 }
 
+/* Inicia la transmisión del siguiente byte pendiente sin esperar a que termine. */
 static void UART_TxStartNext(void)
 {
   uint32_t interruptMask = __get_PRIMASK();
@@ -211,6 +231,7 @@ static void UART_TxStartNext(void)
   }
 }
 
+/* Agrega una cadena completa a la cola TX o registra si no hay espacio. */
 static uint8_t UART_QueueText(const char *text)
 {
   size_t length = strlen(text);
@@ -239,6 +260,38 @@ static uint8_t UART_QueueText(const char *text)
   return 1U;
 }
 
+/* Formatea y encola el estado actual para STATUS o STREAM. */
+static void UART_QueueStatus(const char *prefix)
+{
+  const char *mode = (paused != 0U) ? "PAUSA" :
+                     (rampMode != 0U) ? "AUTO" : "MANUAL";
+  uint32_t appliedDuty = (paused != 0U) ? 0U :
+                         (rampMode != 0U) ? dutyCycle : manualDutyPercent;
+  uint32_t errorCount = uartRxOverflowCount + uartRxErrorCount +
+                        uartLineOverflowCount + uartTxOverflowCount +
+                        uartTxErrorCount;
+  char response[192];
+  int responseLength = snprintf(response, sizeof(response),
+                                "%s MODE=%s FREQ=%u DUTY=%lu MANUAL=%u "
+                                "UPTIME_MS=%lu SHORT=%lu LONG=%lu ERR=%lu\r\n",
+                                prefix, mode, (unsigned int)pwmFrequencyHz,
+                                (unsigned long)appliedDuty,
+                                (unsigned int)manualDutyPercent,
+                                (unsigned long)appTickMs,
+                                (unsigned long)acceptedShortPresses,
+                                (unsigned long)acceptedLongPresses,
+                                (unsigned long)errorCount);
+  if ((responseLength > 0) && ((size_t)responseLength < sizeof(response)))
+  {
+    UART_QueueText(response);
+  }
+  else
+  {
+    uartTxErrorCount++;
+  }
+}
+
+/* Convierte dígitos decimales estrictos a entero y detecta desbordamiento. */
 static uint8_t UART_ParseUnsigned(const char *text, uint32_t *value)
 {
   if (*text == '\0')
@@ -267,6 +320,7 @@ static uint8_t UART_ParseUnsigned(const char *text, uint32_t *value)
   return 1U;
 }
 
+/* Valida y ejecuta una orden completa recibida por USART2. */
 static void UART_ProcessCommand(char *line)
 {
   char *command = line;
@@ -316,32 +370,39 @@ static void UART_ProcessCommand(char *line)
       return;
     }
 
-    const char *mode = (paused != 0U) ? "PAUSA" :
-                       (rampMode != 0U) ? "AUTO" : "MANUAL";
-    uint32_t appliedDuty = (paused != 0U) ? 0U :
-                           (rampMode != 0U) ? dutyCycle : manualDutyPercent;
-    uint32_t errorCount = uartRxOverflowCount + uartRxErrorCount +
-                          uartLineOverflowCount + uartTxOverflowCount +
-                          uartTxErrorCount;
-    char response[192];
-    int responseLength = snprintf(response, sizeof(response),
-                                  "OK MODE=%s FREQ=%u DUTY=%lu MANUAL=%u "
-                                  "UPTIME_MS=%lu SHORT=%lu LONG=%lu ERR=%lu\r\n",
-                                  mode, (unsigned int)pwmFrequencyHz,
-                                  (unsigned long)appliedDuty,
-                                  (unsigned int)manualDutyPercent,
-                                  (unsigned long)appTickMs,
-                                  (unsigned long)acceptedShortPresses,
-                                  (unsigned long)acceptedLongPresses,
-                                  (unsigned long)errorCount);
-    if ((responseLength > 0) && ((size_t)responseLength < sizeof(response)))
+    UART_QueueStatus("OK");
+    return;
+  }
+
+  if (strcmp(command, "MODE") == 0)
+  {
+    if (paused != 0U)
     {
-      UART_QueueText(response);
+      UART_QueueText("ERR STATE\r\n");
+      return;
     }
-    else
+    if (strcmp(argument, "MANUAL") == 0)
     {
-      uartTxErrorCount++;
+      rampMode = 0U;
+      lastDutyUpdateMs = appTickMs;
+      HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+      PWM_ApplyCurrentMode();
+      UART_QueueText("OK\r\n");
+      return;
     }
+    if (strcmp(argument, "AUTO") == 0)
+    {
+      rampMode = 1U;
+      dutyCycle = dutyMin;
+      rampIncreasing = 1U;
+      lastDutyUpdateMs = appTickMs;
+      lastAutoLedToggleMs = appTickMs;
+      HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+      PWM_ApplyCurrentMode();
+      UART_QueueText("OK\r\n");
+      return;
+    }
+    UART_QueueText("ERR ARG\r\n");
     return;
   }
 
@@ -426,9 +487,50 @@ static void UART_ProcessCommand(char *line)
     return;
   }
 
+  if (strcmp(command, "STREAM") == 0)
+  {
+    if (strcmp(argument, "ON") == 0)
+    {
+      telemetryEnabled = 1U;
+      lastTelemetryMs = appTickMs;
+      UART_QueueText("OK\r\n");
+      return;
+    }
+    if (strcmp(argument, "OFF") == 0)
+    {
+      telemetryEnabled = 0U;
+      UART_QueueText("OK\r\n");
+      return;
+    }
+    UART_QueueText("ERR ARG\r\n");
+    return;
+  }
+
   UART_QueueText("ERR COMMAND\r\n");
 }
 
+/* Emite estado cada segundo; difiere la salida mientras se escribe una línea. */
+static void UART_ProcessTelemetry(uint32_t now)
+{
+  if (telemetryEnabled == 0U)
+  {
+    return;
+  }
+
+  if ((uartLineLength != 0U) || (uartLineDiscarding != 0U))
+  {
+    lastTelemetryMs = now;
+    return;
+  }
+
+  if ((uint32_t)(now - lastTelemetryMs) >= 1000U)
+  {
+    lastTelemetryMs = now;
+    UART_QueueStatus("STREAM");
+  }
+}
+
+/* Consume bytes RX, arma líneas CR/LF y entrega líneas completas al parser. */
 static void UART_ProcessRx(void)
 {
   uint32_t interruptMask = __get_PRIMASK();
@@ -496,6 +598,7 @@ static void UART_ProcessRx(void)
   }
 }
 
+/* Toma y limpia de forma atómica el aviso de flanco creado por la ISR. */
 static uint8_t Button_TakeEdgePending(void)
 {
   uint32_t interruptMask = __get_PRIMASK();
@@ -506,6 +609,7 @@ static uint8_t Button_TakeEdgePending(void)
   return edgePending;
 }
 
+/* Aplica al CCR el duty que corresponde al modo actual o a PAUSA. */
 static void PWM_ApplyCurrentMode(void)
 {
   if (paused != 0U)
@@ -523,6 +627,7 @@ static void PWM_ApplyCurrentMode(void)
   }
 }
 
+/* Entra o sale de PAUSA preservando el estado previo de la rampa. */
 static void Application_SetPaused(uint8_t shouldPause, uint32_t now)
 {
   if (paused == shouldPause)
@@ -546,6 +651,7 @@ static void Application_SetPaused(uint8_t shouldPause, uint32_t now)
   PWM_ApplyCurrentMode();
 }
 
+/* Alterna MANUAL/AUTO para una pulsación corta aceptada. */
 static void Button_HandleShortPress(uint32_t now)
 {
   if (paused != 0U)
@@ -572,12 +678,14 @@ static void Button_HandleShortPress(uint32_t now)
   PWM_ApplyCurrentMode();
 }
 
+/* Cuenta y usa una pulsación larga para alternar PAUSA. */
 static void Button_HandleLongPress(uint32_t now)
 {
   acceptedLongPresses++;
   Application_SetPaused((paused == 0U) ? 1U : 0U, now);
 }
 
+/* Valida 30 ms estables, clasifica pulsaciones y actualiza LED de estado. */
 static void Button_Process(uint32_t now)
 {
   GPIO_PinState pinState = HAL_GPIO_ReadPin(BotonAzul_GPIO_Port, BotonAzul_Pin);
@@ -641,6 +749,7 @@ static void Button_Process(uint32_t now)
   }
 }
 
+/* La ISR HAL llama esto; solo se registra el flanco del botón azul. */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == BotonAzul_Pin)
@@ -649,6 +758,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   }
 }
 
+/* Guarda el byte recibido y rearma RX; no interpreta comandos en la ISR. */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART2)
@@ -672,6 +782,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
   }
 }
 
+/* Cuenta errores UART y solicita descartar la línea afectada. */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART2)
@@ -685,6 +796,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   }
 }
 
+/* Al terminar un byte TX, inicia el siguiente byte de la cola. */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART2)
@@ -694,6 +806,7 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
   }
 }
 
+/* Mantiene el contador de aplicación de 1 ms generado por TIM6. */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM6)
@@ -708,6 +821,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   * @brief  The application entry point.
   * @retval int
   */
+/* Inicializa periféricos y ejecuta los servicios cooperativos del programa. */
 int main(void)
 {
 
@@ -775,6 +889,7 @@ int main(void)
     uint32_t now = appTickMs;
     UART_ProcessRx();
     UART_TxStartNext();
+    UART_ProcessTelemetry(now);
     Button_Process(now);
 
     while ((rampMode != 0U) && (paused == 0U) &&

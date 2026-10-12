@@ -199,11 +199,13 @@ void SysTick_Handler(void)
 /* please refer to the startup file (startup_stm32f3xx.s).                    */
 /******************************************************************************/
 
+/* Entrega la interrupción USART2 al driver HAL para atender RX/TX. */
 void USART2_IRQHandler(void)
 {
   HAL_UART_IRQHandler(&huart2);
 }
 
+/* Atiende y limpia flags de las líneas EXTI compartidas 10 a 15. */
 void EXTI15_10_IRQHandler(void)
 {
   for (uint32_t line = 0U; line < 6U; line++)
