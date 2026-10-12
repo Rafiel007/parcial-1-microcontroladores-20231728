@@ -53,10 +53,12 @@ TIM_HandleTypeDef htim6;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+
 uint16_t dutyCycle = 10U;
 uint16_t dutyMin = 10U;
 uint16_t dutyMax = 90U;
 static uint32_t fixedPulse = 0U;
+static uint16_t manualDutyPercent = 0U;
 static uint8_t rampIncreasing = 1U;
 static uint8_t rampMode = 0U;
 static uint8_t paused = 0U;
@@ -111,6 +113,10 @@ static uint32_t PWM_DutyToPulse(uint16_t dutyPercent);
 static void PWM_ApplyCurrentMode(void);
 static void Button_HandleShortPress(uint32_t now);
 static void Button_HandleLongPress(uint32_t now);
+static uint32_t PWM_GetCounterClockHz(void);
+static uint8_t PWM_SetFrequency(uint16_t frequencyHz);
+static void Application_SetPaused(uint8_t shouldPause, uint32_t now);
+static uint8_t UART_ParseUnsigned(const char *text, uint32_t *value);
 static uint8_t UART_TakeRxByte(uint8_t *byte);
 static void UART_ProcessRx(void);
 static uint8_t UART_QueueText(const char *text);
@@ -124,6 +130,45 @@ static void UART_ProcessCommand(char *line);
 static uint32_t PWM_DutyToPulse(uint16_t dutyPercent)
 {
   return ((htim2.Init.Period + 1U) * dutyPercent) / 100U;
+}
+
+static uint32_t PWM_GetCounterClockHz(void)
+{
+  RCC_ClkInitTypeDef clockConfig = {0};
+  uint32_t flashLatency = 0U;
+  HAL_RCC_GetClockConfig(&clockConfig, &flashLatency);
+
+  uint32_t timerClockHz = HAL_RCC_GetPCLK1Freq();
+  if (clockConfig.APB1CLKDivider != RCC_HCLK_DIV1)
+  {
+    timerClockHz *= 2U;
+  }
+
+  return timerClockHz / (htim2.Init.Prescaler + 1U);
+}
+
+static uint8_t PWM_SetFrequency(uint16_t frequencyHz)
+{
+  uint32_t counterClockHz = PWM_GetCounterClockHz();
+  if ((frequencyHz == 0U) || ((counterClockHz % frequencyHz) != 0U))
+  {
+    return 0U;
+  }
+
+  uint32_t periodCounts = counterClockHz / frequencyHz;
+  if (periodCounts == 0U)
+  {
+    return 0U;
+  }
+
+  uint32_t newPeriod = periodCounts - 1U;
+  __HAL_TIM_SET_COUNTER(&htim2, 0U);
+  htim2.Init.Period = newPeriod;
+  __HAL_TIM_SET_AUTORELOAD(&htim2, newPeriod);
+  fixedPulse = PWM_DutyToPulse(manualDutyPercent);
+  pwmFrequencyHz = frequencyHz;
+  PWM_ApplyCurrentMode();
+  return 1U;
 }
 
 static uint8_t UART_TakeRxByte(uint8_t *byte)
@@ -194,6 +239,34 @@ static uint8_t UART_QueueText(const char *text)
   return 1U;
 }
 
+static uint8_t UART_ParseUnsigned(const char *text, uint32_t *value)
+{
+  if (*text == '\0')
+  {
+    return 0U;
+  }
+
+  uint32_t parsed = 0U;
+  while (*text != '\0')
+  {
+    if ((*text < '0') || (*text > '9'))
+    {
+      return 0U;
+    }
+
+    uint32_t digit = (uint32_t)(*text - '0');
+    if (parsed > ((UINT32_MAX - digit) / 10U))
+    {
+      return 2U;
+    }
+    parsed = (parsed * 10U) + digit;
+    text++;
+  }
+
+  *value = parsed;
+  return 1U;
+}
+
 static void UART_ProcessCommand(char *line)
 {
   char *command = line;
@@ -238,27 +311,25 @@ static void UART_ProcessCommand(char *line)
 
     if (strcmp(command, "HELP") == 0)
     {
-      UART_QueueText("OK HELP\r\nHELP\r\nSTATUS\r\n");
+      UART_QueueText("OK HELP\r\nHELP\r\nSTATUS\r\nDUTY n\r\nFREQ n\r\n"
+                     "PAUSE\r\nRESUME\r\n");
       return;
     }
 
     const char *mode = (paused != 0U) ? "PAUSA" :
                        (rampMode != 0U) ? "AUTO" : "MANUAL";
-    uint32_t periodCounts = htim2.Init.Period + 1U;
-    uint32_t manualDuty = (periodCounts != 0U) ?
-                          (fixedPulse * 100U) / periodCounts : 0U;
     uint32_t appliedDuty = (paused != 0U) ? 0U :
-                           (rampMode != 0U) ? dutyCycle : manualDuty;
+                           (rampMode != 0U) ? dutyCycle : manualDutyPercent;
     uint32_t errorCount = uartRxOverflowCount + uartRxErrorCount +
                           uartLineOverflowCount + uartTxOverflowCount +
                           uartTxErrorCount;
     char response[192];
     int responseLength = snprintf(response, sizeof(response),
-                                  "OK\n MODE=%s FREQ=%u DUTY=%lu MANUAL=%lu "
+                                  "OK MODE=%s FREQ=%u DUTY=%lu MANUAL=%u "
                                   "UPTIME_MS=%lu SHORT=%lu LONG=%lu ERR=%lu\r\n",
                                   mode, (unsigned int)pwmFrequencyHz,
                                   (unsigned long)appliedDuty,
-                                  (unsigned long)manualDuty,
+                                  (unsigned int)manualDutyPercent,
                                   (unsigned long)appTickMs,
                                   (unsigned long)acceptedShortPresses,
                                   (unsigned long)acceptedLongPresses,
@@ -271,6 +342,87 @@ static void UART_ProcessCommand(char *line)
     {
       uartTxErrorCount++;
     }
+    return;
+  }
+
+  if ((strcmp(command, "DUTY") == 0) || (strcmp(command, "FREQ") == 0))
+  {
+    if (paused != 0U)
+    {
+      UART_QueueText("ERR STATE\r\n");
+      return;
+    }
+    if ((strcmp(command, "DUTY") == 0) && (rampMode != 0U))
+    {
+      UART_QueueText("ERR STATE\r\n");
+      return;
+    }
+
+    uint32_t value = 0U;
+    uint8_t parseResult = UART_ParseUnsigned(argument, &value);
+    if (parseResult == 0U)
+    {
+      UART_QueueText("ERR ARG\r\n");
+      return;
+    }
+    if (parseResult == 2U)
+    {
+      UART_QueueText("ERR RANGE\r\n");
+      return;
+    }
+
+    if (strcmp(command, "DUTY") == 0)
+    {
+      if (value > 100U)
+      {
+        UART_QueueText("ERR RANGE\r\n");
+        return;
+      }
+
+      manualDutyPercent = (uint16_t)value;
+      fixedPulse = PWM_DutyToPulse(manualDutyPercent);
+      PWM_ApplyCurrentMode();
+      UART_QueueText("OK\r\n");
+      return;
+    }
+
+    if ((value != 500U) && (value != 1000U) && (value != 2000U))
+    {
+      UART_QueueText("ERR RANGE\r\n");
+      return;
+    }
+    if (PWM_SetFrequency((uint16_t)value) == 0U)
+    {
+      UART_QueueText("ERR RANGE\r\n");
+      return;
+    }
+    UART_QueueText("OK\r\n");
+    return;
+  }
+
+  if ((strcmp(command, "PAUSE") == 0) ||
+      (strcmp(command, "RESUME") == 0))
+  {
+    if (*argument != '\0')
+    {
+      UART_QueueText("ERR ARG\r\n");
+      return;
+    }
+
+    if (strcmp(command, "PAUSE") == 0)
+    {
+      Application_SetPaused(1U, appTickMs);
+      UART_QueueText("OK\r\n");
+      return;
+    }
+
+    if (paused == 0U)
+    {
+      UART_QueueText("ERR STATE\r\n");
+      return;
+    }
+    Application_SetPaused(0U, appTickMs);
+    UART_QueueText("OK\r\n");
     return;
   }
 
@@ -371,6 +523,29 @@ static void PWM_ApplyCurrentMode(void)
   }
 }
 
+static void Application_SetPaused(uint8_t shouldPause, uint32_t now)
+{
+  if (paused == shouldPause)
+  {
+    return;
+  }
+
+  paused = shouldPause;
+  lastDutyUpdateMs = now;
+  if (paused != 0U)
+  {
+    lastPauseLedToggleMs = now;
+    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+  }
+  else
+  {
+    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+    lastAutoLedToggleMs = now;
+  }
+
+  PWM_ApplyCurrentMode();
+}
+
 static void Button_HandleShortPress(uint32_t now)
 {
   if (paused != 0U)
@@ -400,21 +575,7 @@ static void Button_HandleShortPress(uint32_t now)
 static void Button_HandleLongPress(uint32_t now)
 {
   acceptedLongPresses++;
-  paused = (paused == 0U) ? 1U : 0U;
-  lastDutyUpdateMs = now;
-
-  if (paused != 0U)
-  {
-    lastPauseLedToggleMs = now;
-    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
-  }
-  else
-  {
-    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
-    lastAutoLedToggleMs = now;
-  }
-
-  PWM_ApplyCurrentMode();
+  Application_SetPaused((paused == 0U) ? 1U : 0U, now);
 }
 
 static void Button_Process(uint32_t now)
@@ -592,6 +753,8 @@ int main(void)
     buttonPressStartMs = appTickMs;
   }
   fixedPulse = __HAL_TIM_GET_COMPARE(&htim2, TIM_CHANNEL_2);
+  manualDutyPercent = (uint16_t)((fixedPulse * 100U) /
+                                 (htim2.Init.Period + 1U));
   lastDutyUpdateMs = appTickMs;
   HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
   if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2) != HAL_OK)
@@ -694,28 +857,21 @@ void SystemClock_Config(void)
   */
 static void MX_TIM2_Init(void)
 {
-
-  /* USER CODE BEGIN TIM2_Init 0 */
-
-  /* USER CODE END TIM2_Init 0 */
-
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
 
-  /* USER CODE BEGIN TIM2_Init 1 */
-
-  /* USER CODE END TIM2_Init 1 */
   htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 8-1;
+  htim2.Init.Prescaler = 8U - 1U;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 1000-1;
+  htim2.Init.Period = 1000U - 1U;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
   {
     Error_Handler();
   }
+
   sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
   if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
   {
@@ -725,25 +881,23 @@ static void MX_TIM2_Init(void)
   {
     Error_Handler();
   }
+
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
+
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 250;
+  sConfigOC.Pulse = 250U;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN TIM2_Init 2 */
-
-  /* USER CODE END TIM2_Init 2 */
   HAL_TIM_MspPostInit(&htim2);
-
 }
 
 /**
@@ -753,35 +907,24 @@ static void MX_TIM2_Init(void)
   */
 static void MX_TIM6_Init(void)
 {
-
-  /* USER CODE BEGIN TIM6_Init 0 */
-
-  /* USER CODE END TIM6_Init 0 */
-
   TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-  /* USER CODE BEGIN TIM6_Init 1 */
-
-  /* USER CODE END TIM6_Init 1 */
   htim6.Instance = TIM6;
-  htim6.Init.Prescaler = 79;
+  htim6.Init.Prescaler = 79U;
   htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim6.Init.Period = 99;
+  htim6.Init.Period = 99U;
   htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
   {
     Error_Handler();
   }
+
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN TIM6_Init 2 */
-
-  /* USER CODE END TIM6_Init 2 */
-
 }
 
 /**
