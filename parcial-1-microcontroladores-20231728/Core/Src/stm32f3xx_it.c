@@ -57,6 +57,7 @@
 /* External variables --------------------------------------------------------*/
 extern TIM_HandleTypeDef htim6;
 /* USER CODE BEGIN EV */
+extern UART_HandleTypeDef huart2;
 
 /* USER CODE END EV */
 
@@ -197,6 +198,11 @@ void SysTick_Handler(void)
 /* For the available peripheral interrupt handler names,                      */
 /* please refer to the startup file (startup_stm32f3xx.s).                    */
 /******************************************************************************/
+
+void USART2_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart2);
+}
 
 void EXTI15_10_IRQHandler(void)
 {

@@ -18,6 +18,8 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include <stdio.h>
+#include <string.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -31,6 +33,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define UART_RX_BUFFER_SIZE 256U
+#define UART_RX_BUFFER_MASK (UART_RX_BUFFER_SIZE - 1U)
+#define UART_LINE_MAX_LENGTH 63U
+#define UART_TX_BUFFER_SIZE 512U
+#define UART_TX_BUFFER_MASK (UART_TX_BUFFER_SIZE - 1U)
 
 /* USER CODE END PD */
 
@@ -66,6 +73,28 @@ static uint32_t buttonPressStartMs = 0U;
 static uint8_t buttonLongPressHandled = 0U;
 static uint32_t acceptedShortPresses = 0U;
 static uint32_t acceptedLongPresses = 0U;
+static uint8_t uartRxByte = 0U;
+static uint8_t uartRxBuffer[UART_RX_BUFFER_SIZE];
+static volatile uint16_t uartRxHead = 0U;
+static volatile uint16_t uartRxTail = 0U;
+static volatile uint8_t uartRxOverflowPending = 0U;
+static volatile uint32_t uartRxOverflowCount = 0U;
+static volatile uint32_t uartRxErrorCount = 0U;
+static char uartLineBuffer[UART_LINE_MAX_LENGTH + 1U];
+static char uartLastLine[UART_LINE_MAX_LENGTH + 1U];
+static uint8_t uartLineLength = 0U;
+static uint8_t uartLineDiscarding = 0U;
+static uint8_t uartSkipLfAfterCr = 0U;
+static uint32_t uartCompletedLineCount = 0U;
+static uint32_t uartLineOverflowCount = 0U;
+static uint16_t pwmFrequencyHz = 1000U;
+static char uartTxBuffer[UART_TX_BUFFER_SIZE];
+static volatile uint16_t uartTxHead = 0U;
+static volatile uint16_t uartTxTail = 0U;
+static volatile uint8_t uartTxBusy = 0U;
+static uint8_t uartTxByteInFlight = 0U;
+static volatile uint32_t uartTxOverflowCount = 0U;
+static volatile uint32_t uartTxErrorCount = 0U;
 
 /* USER CODE END PV */
 
@@ -82,6 +111,11 @@ static uint32_t PWM_DutyToPulse(uint16_t dutyPercent);
 static void PWM_ApplyCurrentMode(void);
 static void Button_HandleShortPress(uint32_t now);
 static void Button_HandleLongPress(uint32_t now);
+static uint8_t UART_TakeRxByte(uint8_t *byte);
+static void UART_ProcessRx(void);
+static uint8_t UART_QueueText(const char *text);
+static void UART_TxStartNext(void);
+static void UART_ProcessCommand(char *line);
 
 /* USER CODE END PFP */
 
@@ -90,6 +124,224 @@ static void Button_HandleLongPress(uint32_t now);
 static uint32_t PWM_DutyToPulse(uint16_t dutyPercent)
 {
   return ((htim2.Init.Period + 1U) * dutyPercent) / 100U;
+}
+
+static uint8_t UART_TakeRxByte(uint8_t *byte)
+{
+  uint16_t tail = uartRxTail;
+  if (tail == uartRxHead)
+  {
+    return 0U;
+  }
+
+  *byte = uartRxBuffer[tail];
+  uartRxTail = (tail + 1U) & UART_RX_BUFFER_MASK;
+  return 1U;
+}
+
+static void UART_TxStartNext(void)
+{
+  uint32_t interruptMask = __get_PRIMASK();
+  __disable_irq();
+
+  if ((uartTxBusy != 0U) || (uartTxTail == uartTxHead))
+  {
+    __set_PRIMASK(interruptMask);
+    return;
+  }
+
+  uartTxByteInFlight = (uint8_t)uartTxBuffer[uartTxTail];
+  uartTxTail = (uartTxTail + 1U) & UART_TX_BUFFER_MASK;
+  uartTxBusy = 1U;
+  __set_PRIMASK(interruptMask);
+
+  if (HAL_UART_Transmit_IT(&huart2, &uartTxByteInFlight, 1U) != HAL_OK)
+  {
+    interruptMask = __get_PRIMASK();
+    __disable_irq();
+    uartTxTail = (uartTxTail - 1U) & UART_TX_BUFFER_MASK;
+    uartTxBusy = 0U;
+    uartTxErrorCount++;
+    __set_PRIMASK(interruptMask);
+  }
+}
+
+static uint8_t UART_QueueText(const char *text)
+{
+  size_t length = strlen(text);
+  uint32_t interruptMask = __get_PRIMASK();
+  __disable_irq();
+
+  uint16_t used = (uartTxHead - uartTxTail) & UART_TX_BUFFER_MASK;
+  uint16_t freeSpace = UART_TX_BUFFER_MASK - used;
+  if (length > freeSpace)
+  {
+    uartTxOverflowCount++;
+    __set_PRIMASK(interruptMask);
+    return 0U;
+  }
+
+  uint16_t head = uartTxHead;
+  for (size_t index = 0U; index < length; index++)
+  {
+    uartTxBuffer[head] = text[index];
+    head = (head + 1U) & UART_TX_BUFFER_MASK;
+  }
+  uartTxHead = head;
+  __set_PRIMASK(interruptMask);
+
+  UART_TxStartNext();
+  return 1U;
+}
+
+static void UART_ProcessCommand(char *line)
+{
+  char *command = line;
+  while (*command == ' ')
+  {
+    command++;
+  }
+
+  size_t length = strlen(command);
+  while ((length > 0U) && (command[length - 1U] == ' '))
+  {
+    command[--length] = '\0';
+  }
+
+  if (length == 0U)
+  {
+    return;
+  }
+
+  char *argument = command;
+  while ((*argument != '\0') && (*argument != ' '))
+  {
+    argument++;
+  }
+  if (*argument != '\0')
+  {
+    *argument++ = '\0';
+    while (*argument == ' ')
+    {
+      argument++;
+    }
+  }
+
+  if ((strcmp(command, "HELP") == 0) ||
+      (strcmp(command, "STATUS") == 0))
+  {
+    if (*argument != '\0')
+    {
+      UART_QueueText("ERR ARG\r\n");
+      return;
+    }
+
+    if (strcmp(command, "HELP") == 0)
+    {
+      UART_QueueText("OK HELP\r\nHELP\r\nSTATUS\r\n");
+      return;
+    }
+
+    const char *mode = (paused != 0U) ? "PAUSA" :
+                       (rampMode != 0U) ? "AUTO" : "MANUAL";
+    uint32_t periodCounts = htim2.Init.Period + 1U;
+    uint32_t manualDuty = (periodCounts != 0U) ?
+                          (fixedPulse * 100U) / periodCounts : 0U;
+    uint32_t appliedDuty = (paused != 0U) ? 0U :
+                           (rampMode != 0U) ? dutyCycle : manualDuty;
+    uint32_t errorCount = uartRxOverflowCount + uartRxErrorCount +
+                          uartLineOverflowCount + uartTxOverflowCount +
+                          uartTxErrorCount;
+    char response[192];
+    int responseLength = snprintf(response, sizeof(response),
+                                  "OK\n MODE=%s FREQ=%u DUTY=%lu MANUAL=%lu "
+                                  "UPTIME_MS=%lu SHORT=%lu LONG=%lu ERR=%lu\r\n",
+                                  mode, (unsigned int)pwmFrequencyHz,
+                                  (unsigned long)appliedDuty,
+                                  (unsigned long)manualDuty,
+                                  (unsigned long)appTickMs,
+                                  (unsigned long)acceptedShortPresses,
+                                  (unsigned long)acceptedLongPresses,
+                                  (unsigned long)errorCount);
+    if ((responseLength > 0) && ((size_t)responseLength < sizeof(response)))
+    {
+      UART_QueueText(response);
+    }
+    else
+    {
+      uartTxErrorCount++;
+    }
+    return;
+  }
+
+  UART_QueueText("ERR COMMAND\r\n");
+}
+
+static void UART_ProcessRx(void)
+{
+  uint32_t interruptMask = __get_PRIMASK();
+  __disable_irq();
+  uint8_t overflowPending = uartRxOverflowPending;
+  uartRxOverflowPending = 0U;
+  __set_PRIMASK(interruptMask);
+
+  if (overflowPending != 0U)
+  {
+    uartLineLength = 0U;
+    uartLineDiscarding = 1U;
+    uartRxErrorCount++;
+  }
+
+  uint8_t byte;
+  while (UART_TakeRxByte(&byte) != 0U)
+  {
+    if ((uartSkipLfAfterCr != 0U) && (byte == '\n'))
+    {
+      uartSkipLfAfterCr = 0U;
+      continue;
+    }
+    uartSkipLfAfterCr = 0U;
+
+    if ((byte == '\r') || (byte == '\n'))
+    {
+      if (byte == '\r')
+      {
+        uartSkipLfAfterCr = 1U;
+      }
+
+      if (uartLineDiscarding != 0U)
+      {
+        uartLineDiscarding = 0U;
+        UART_QueueText("ERR OVERFLOW\r\n");
+      }
+      else
+      {
+        uartLineBuffer[uartLineLength] = '\0';
+        for (uint8_t index = 0U; index <= uartLineLength; index++)
+        {
+          uartLastLine[index] = uartLineBuffer[index];
+        }
+        uartCompletedLineCount++;
+        UART_ProcessCommand(uartLineBuffer);
+      }
+      uartLineLength = 0U;
+      continue;
+    }
+
+    if (uartLineDiscarding == 0U)
+    {
+      if (uartLineLength < UART_LINE_MAX_LENGTH)
+      {
+        uartLineBuffer[uartLineLength++] = (char)byte;
+      }
+      else
+      {
+        uartLineLength = 0U;
+        uartLineDiscarding = 1U;
+        uartLineOverflowCount++;
+      }
+    }
+  }
 }
 
 static uint8_t Button_TakeEdgePending(void)
@@ -236,6 +488,51 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   }
 }
 
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)
+  {
+    uint16_t nextHead = (uartRxHead + 1U) & UART_RX_BUFFER_MASK;
+    if (nextHead == uartRxTail)
+    {
+      uartRxOverflowCount++;
+      uartRxOverflowPending = 1U;
+    }
+    else
+    {
+      uartRxBuffer[uartRxHead] = uartRxByte;
+      uartRxHead = nextHead;
+    }
+
+    if (HAL_UART_Receive_IT(huart, &uartRxByte, 1U) != HAL_OK)
+    {
+      uartRxErrorCount++;
+    }
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)
+  {
+    uartRxErrorCount++;
+    uartRxOverflowPending = 1U;
+    if (HAL_UART_Receive_IT(huart, &uartRxByte, 1U) != HAL_OK)
+    {
+      uartRxErrorCount++;
+    }
+  }
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)
+  {
+    uartTxBusy = 0U;
+    UART_TxStartNext();
+  }
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM6)
@@ -279,6 +576,14 @@ int main(void)
   MX_TIM2_Init();
   MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
+  uint8_t testMessage[] = "USART2 lista\r\n";
+  HAL_NVIC_SetPriority(USART2_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(USART2_IRQn);
+  if (HAL_UART_Receive_IT(&huart2, &uartRxByte, 1U) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  HAL_UART_Transmit(&huart2, testMessage, sizeof(testMessage) - 1U, 100U);
 
   buttonStableState = HAL_GPIO_ReadPin(BotonAzul_GPIO_Port, BotonAzul_Pin);
   buttonCandidateState = buttonStableState;
@@ -305,6 +610,8 @@ int main(void)
   while (1)
   {
     uint32_t now = appTickMs;
+    UART_ProcessRx();
+    UART_TxStartNext();
     Button_Process(now);
 
     while ((rampMode != 0U) && (paused == 0U) &&
@@ -493,7 +800,7 @@ static void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
-  huart2.Init.BaudRate = 38400;
+  huart2.Init.BaudRate = 115200;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;
